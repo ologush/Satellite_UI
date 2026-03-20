@@ -19,16 +19,15 @@ CMD_RESP_NACK             = 0x21
 # Total byte length of each response packet (including the leading command byte)
 RESPONSE_LENGTHS = {
     CMD_RESP_BASE_SENSOR_DATA: 9,   # 0x11 + temp(4) + pot(4)
-    CMD_RESP_SAT_SENSOR_DATA:  25,  # 0x10 + xcvr_temp(4) + mcu_temp(4) + pot(4) + adcs(12)
+    CMD_RESP_SAT_SENSOR_DATA:  21,  # 0x10 + sat_temp(4) + pot(4) + yaw(4) + yaw_rate(4) + imu_temp(4)
     CMD_RESP_ACK:              2,   # 0x20 + original_cmd
     CMD_RESP_NACK:             2,   # 0x21 + original_cmd
 }
 
 ADCS_MODES = {
-    0: "Detumbling",
-    1: "Sun Point",
-    2: "Nadir",
-    3: "Inertial",
+    0: "Attitude Target",
+    1: "Spin Rate Target",
+    2: "Attitude Control Off",
 }
 
 POLL_INTERVAL_MS  = 2000   # poll each data source every 2 s
@@ -78,10 +77,11 @@ class SatelliteGroundUI(tk.Tk):
         self.base_pot_var  = tk.StringVar(value="—")
 
         # Satellite sensor display vars
-        self.sat_xcvr_temp_var = tk.StringVar(value="—")
-        self.sat_mcu_temp_var  = tk.StringVar(value="—")
+        self.sat_temp_var      = tk.StringVar(value="—")
         self.sat_pot_var       = tk.StringVar(value="—")
-        self.sat_adcs_raw_var  = tk.StringVar(value="—")
+        self.sat_yaw_var       = tk.StringVar(value="—")
+        self.sat_yaw_rate_var  = tk.StringVar(value="—")
+        self.sat_imu_temp_var  = tk.StringVar(value="—")
 
         self._build_ui()
         self.refresh_ports()
@@ -143,21 +143,25 @@ class SatelliteGroundUI(tk.Tk):
         sat.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         sat.columnconfigure(1, weight=1)
 
-        ttk.Label(sat, text="XCVR Temp:").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Label(sat, textvariable=self.sat_xcvr_temp_var, font=VALUE_FONT).grid(
+        ttk.Label(sat, text="Sat Temp:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Label(sat, textvariable=self.sat_temp_var, font=VALUE_FONT).grid(
             row=0, column=1, sticky="w", **pad)
 
-        ttk.Label(sat, text="MCU Temp:").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Label(sat, textvariable=self.sat_mcu_temp_var, font=VALUE_FONT).grid(
+        ttk.Label(sat, text="Potentiometer:").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Label(sat, textvariable=self.sat_pot_var, font=VALUE_FONT).grid(
             row=1, column=1, sticky="w", **pad)
 
-        ttk.Label(sat, text="Potentiometer:").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Label(sat, textvariable=self.sat_pot_var, font=VALUE_FONT).grid(
+        ttk.Label(sat, text="Yaw:").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(sat, textvariable=self.sat_yaw_var, font=VALUE_FONT).grid(
             row=2, column=1, sticky="w", **pad)
 
-        ttk.Label(sat, text="ADCS Raw:").grid(row=3, column=0, sticky="w", **pad)
-        ttk.Label(sat, textvariable=self.sat_adcs_raw_var,
-                  font=("Courier", 10)).grid(row=3, column=1, sticky="w", **pad)
+        ttk.Label(sat, text="Yaw Rate:").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Label(sat, textvariable=self.sat_yaw_rate_var, font=VALUE_FONT).grid(
+            row=3, column=1, sticky="w", **pad)
+
+        ttk.Label(sat, text="IMU Temp:").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Label(sat, textvariable=self.sat_imu_temp_var, font=VALUE_FONT).grid(
+            row=4, column=1, sticky="w", **pad)
 
         # ── ADCS controls ─────────────────────────────────────────────────────
         adcs = ttk.LabelFrame(self, text="ADCS Control")
@@ -378,15 +382,18 @@ class SatelliteGroundUI(tk.Tk):
             self.base_pot_var.set(f"{pot:.1f} %")
             return
 
-        if cmd_id == CMD_RESP_SAT_SENSOR_DATA and len(pkt) >= 25:
-            xcvr_temp = unpack_float_le(pkt, 1)
-            mcu_temp  = unpack_float_le(pkt, 5)
-            pot       = unpack_float_le(pkt, 9)
-            adcs_raw  = pkt[13:25]
-            self.sat_xcvr_temp_var.set(f"{xcvr_temp:.2f} °C")
-            self.sat_mcu_temp_var.set(f"{mcu_temp:.2f} °C")
+        if cmd_id == CMD_RESP_SAT_SENSOR_DATA and len(pkt) >= 21:
+            self.log(f"SAT PKT [{len(pkt)}B]: {pkt.hex(' ').upper()}")
+            sat_temp  = unpack_float_le(pkt, 1)
+            pot       = unpack_float_le(pkt, 5)
+            yaw       = unpack_float_le(pkt, 9)
+            yaw_rate  = unpack_float_le(pkt, 13)
+            imu_temp  = unpack_float_le(pkt, 17)
+            self.sat_temp_var.set(f"{sat_temp:.2f} °C")
             self.sat_pot_var.set(f"{pot:.1f} %")
-            self.sat_adcs_raw_var.set(adcs_raw.hex(" ").upper())
+            self.sat_yaw_var.set(f"{yaw:.4f} rad")
+            self.sat_yaw_rate_var.set(f"{yaw_rate:.2f} °/s")
+            self.sat_imu_temp_var.set(f"{imu_temp:.2f} °C")
             return
 
         if cmd_id == CMD_RESP_ACK and len(pkt) >= 2:
