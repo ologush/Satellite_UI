@@ -33,6 +33,8 @@ ADCS_MODES = {
     2: "Attitude Control Off",
 }
 
+FRAME_SOF = b'\xAA\x55'        # start-of-frame marker prepended to every response
+
 POLL_INTERVAL_MS       = 2000  # poll each data source every 2 s
 SAT_POLL_OFFSET_MS     = 1000  # stagger satellite poll 1 s after base poll
 SAT_ADCS_POLL_OFFSET_MS = 500  # stagger ADCS poll 500 ms after XCVR poll
@@ -75,6 +77,11 @@ class SatelliteGroundUI(tk.Tk):
 
         # ADCS target entry
         self.target_var = tk.StringVar(value="0")
+
+        # Watchdog handles for poll-on-response
+        self._base_watchdog = None
+        self._xcvr_watchdog = None
+        self._adcs_watchdog = None
 
         # Base station sensor display vars
         self.base_temp_var = tk.StringVar(value="—")
@@ -271,19 +278,19 @@ class SatelliteGroundUI(tk.Tk):
         if not (self.ser and self.ser.is_open):
             return
         self._send_bytes(bytes([CMD_GET_BASE_SENSOR_DATA]))
-        self.after(POLL_INTERVAL_MS, self._poll_base)
+        self._base_watchdog = self.after(POLL_INTERVAL_MS * 2, self._poll_base)
 
     def _poll_sat_xcvr(self):
         if not (self.ser and self.ser.is_open):
             return
         self._send_bytes(bytes([CMD_GET_SAT_XCVR_DATA]))
-        self.after(POLL_INTERVAL_MS, self._poll_sat_xcvr)
+        self._xcvr_watchdog = self.after(POLL_INTERVAL_MS * 2, self._poll_sat_xcvr)
 
     def _poll_sat_adcs(self):
         if not (self.ser and self.ser.is_open):
             return
         self._send_bytes(bytes([CMD_GET_SAT_ADCS_DATA]))
-        self.after(POLL_INTERVAL_MS, self._poll_sat_adcs)
+        self._adcs_watchdog = self.after(POLL_INTERVAL_MS * 2, self._poll_sat_adcs)
 
     # ── ADCS commands ─────────────────────────────────────────────────────────
 
@@ -346,18 +353,30 @@ class SatelliteGroundUI(tk.Tk):
                 buf.extend(chunk)
 
                 # Parse as many complete packets as possible
-                while buf:
-                    cmd_id = buf[0]
+                while True:
+                    # Locate next SOF marker
+                    idx = buf.find(FRAME_SOF)
+                    if idx == -1:
+                        buf = buf[-1:]  # keep last byte — may be start of SOF
+                        break
+                    if idx > 0:
+                        self.rx_queue.put(f"__RAW__:  discard {idx}B before SOF")
+                        buf = buf[idx:]
+                    # buf now starts with SOF; need SOF(2) + CMD_ID(1) minimum
+                    if len(buf) < 3:
+                        break
+                    cmd_id = buf[2]
                     pkt_len = RESPONSE_LENGTHS.get(cmd_id)
                     if pkt_len is None:
-                        # Unknown leading byte — discard and re-sync
-                        self.rx_queue.put(f"__RAW__:  discard 0x{cmd_id:02X}")
-                        buf = buf[1:]
+                        # Unknown command after SOF — skip past this SOF and re-sync
+                        self.rx_queue.put(f"__RAW__:  unknown cmd 0x{cmd_id:02X} after SOF")
+                        buf = buf[2:]
                         continue
-                    if len(buf) < pkt_len:
+                    total = 2 + pkt_len  # SOF bytes + packet
+                    if len(buf) < total:
                         break  # wait for more data
-                    packet = bytes(buf[:pkt_len])
-                    buf = buf[pkt_len:]
+                    packet = bytes(buf[2:total])  # strip SOF, pass cmd_id + payload
+                    buf = buf[total:]
                     self.rx_queue.put(packet)
 
             except Exception as e:
@@ -389,21 +408,29 @@ class SatelliteGroundUI(tk.Tk):
         cmd_id = pkt[0]
 
         if cmd_id == CMD_RESP_BASE_SENSOR_DATA and len(pkt) >= 9:
+            if self._base_watchdog:
+                self.after_cancel(self._base_watchdog)
             temp = unpack_float_le(pkt, 1)
             pot  = unpack_float_le(pkt, 5)
             self.base_temp_var.set(f"{temp:.2f} °C")
             self.base_pot_var.set(f"{pot:.1f} %")
+            self.after(POLL_INTERVAL_MS, self._poll_base)
             return
 
         if cmd_id == CMD_RESP_SAT_XCVR_DATA and len(pkt) >= 9:
+            if self._xcvr_watchdog:
+                self.after_cancel(self._xcvr_watchdog)
             self.log(f"SAT XCVR [{len(pkt)}B]: {pkt.hex(' ').upper()}")
             sat_temp = unpack_float_le(pkt, 1)
             pot      = unpack_float_le(pkt, 5)
             self.sat_temp_var.set(f"{sat_temp:.2f} °C")
             self.sat_pot_var.set(f"{pot:.1f} %")
+            self.after(POLL_INTERVAL_MS, self._poll_sat_xcvr)
             return
 
         if cmd_id == CMD_RESP_SAT_ADCS_DATA and len(pkt) >= 13:
+            if self._adcs_watchdog:
+                self.after_cancel(self._adcs_watchdog)
             self.log(f"SAT ADCS [{len(pkt)}B]: {pkt.hex(' ').upper()}")
             yaw      = unpack_float_le(pkt, 1)
             yaw_rate = unpack_float_le(pkt, 5)
@@ -411,6 +438,7 @@ class SatelliteGroundUI(tk.Tk):
             self.sat_yaw_var.set(f"{yaw:.4f} rad")
             self.sat_yaw_rate_var.set(f"{yaw_rate:.2f} °/s")
             self.sat_imu_temp_var.set(f"{imu_temp:.2f} °C")
+            self.after(POLL_INTERVAL_MS, self._poll_sat_adcs)
             return
 
         if cmd_id == CMD_RESP_ACK and len(pkt) >= 2:
