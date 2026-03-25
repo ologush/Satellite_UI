@@ -7,21 +7,24 @@ import serial
 from serial.tools import list_ports
 
 # ── Command IDs ───────────────────────────────────────────────────────────────
-CMD_SET_ADCS_MODE         = 0x01
-CMD_SET_ADCS_TARGET       = 0x02
-CMD_GET_BASE_SENSOR_DATA  = 0x03
-CMD_GET_SAT_SENSOR_DATA   = 0x04
-CMD_RESP_SAT_SENSOR_DATA  = 0x10
-CMD_RESP_BASE_SENSOR_DATA = 0x11
-CMD_RESP_ACK              = 0x20
-CMD_RESP_NACK             = 0x21
+CMD_SET_ADCS_MODE             = 0x01
+CMD_SET_ADCS_TARGET           = 0x02
+CMD_GET_BASE_SENSOR_DATA      = 0x03
+CMD_GET_SAT_XCVR_DATA         = 0x04
+CMD_GET_SAT_ADCS_DATA         = 0x05
+CMD_RESP_SAT_XCVR_DATA        = 0x10
+CMD_RESP_BASE_SENSOR_DATA     = 0x11
+CMD_RESP_SAT_ADCS_DATA        = 0x12
+CMD_RESP_ACK                  = 0x20
+CMD_RESP_NACK                 = 0x21
 
 # Total byte length of each response packet (including the leading command byte)
 RESPONSE_LENGTHS = {
-    CMD_RESP_BASE_SENSOR_DATA: 9,   # 0x11 + temp(4) + pot(4)
-    CMD_RESP_SAT_SENSOR_DATA:  21,  # 0x10 + sat_temp(4) + pot(4) + yaw(4) + yaw_rate(4) + imu_temp(4)
-    CMD_RESP_ACK:              2,   # 0x20 + original_cmd
-    CMD_RESP_NACK:             2,   # 0x21 + original_cmd
+    CMD_RESP_BASE_SENSOR_DATA:  9,   # 0x11 + temp(4) + pot(4)
+    CMD_RESP_SAT_XCVR_DATA:     9,   # 0x10 + sat_temp(4) + pot(4)
+    CMD_RESP_SAT_ADCS_DATA:     13,  # 0x12 + yaw(4) + yaw_rate(4) + imu_temp(4)
+    CMD_RESP_ACK:               2,   # 0x20 + original_cmd
+    CMD_RESP_NACK:              2,   # 0x21 + original_cmd
 }
 
 ADCS_MODES = {
@@ -30,8 +33,9 @@ ADCS_MODES = {
     2: "Attitude Control Off",
 }
 
-POLL_INTERVAL_MS  = 2000   # poll each data source every 2 s
-SAT_POLL_OFFSET_MS = 1000  # stagger satellite poll 1 s after base poll
+POLL_INTERVAL_MS       = 2000  # poll each data source every 2 s
+SAT_POLL_OFFSET_MS     = 1000  # stagger satellite poll 1 s after base poll
+SAT_ADCS_POLL_OFFSET_MS = 500  # stagger ADCS poll 500 ms after XCVR poll
 
 
 def get_serial_ports():
@@ -76,12 +80,14 @@ class SatelliteGroundUI(tk.Tk):
         self.base_temp_var = tk.StringVar(value="—")
         self.base_pot_var  = tk.StringVar(value="—")
 
-        # Satellite sensor display vars
-        self.sat_temp_var      = tk.StringVar(value="—")
-        self.sat_pot_var       = tk.StringVar(value="—")
-        self.sat_yaw_var       = tk.StringVar(value="—")
-        self.sat_yaw_rate_var  = tk.StringVar(value="—")
-        self.sat_imu_temp_var  = tk.StringVar(value="—")
+        # Satellite XCVR display vars
+        self.sat_temp_var     = tk.StringVar(value="—")
+        self.sat_pot_var      = tk.StringVar(value="—")
+
+        # Satellite ADCS display vars
+        self.sat_yaw_var      = tk.StringVar(value="—")
+        self.sat_yaw_rate_var = tk.StringVar(value="—")
+        self.sat_imu_temp_var = tk.StringVar(value="—")
 
         self._build_ui()
         self.refresh_ports()
@@ -258,7 +264,8 @@ class SatelliteGroundUI(tk.Tk):
 
     def _start_polls(self):
         self._poll_base()
-        self.after(SAT_POLL_OFFSET_MS, self._poll_sat)
+        self.after(SAT_POLL_OFFSET_MS, self._poll_sat_xcvr)
+        self.after(SAT_POLL_OFFSET_MS + SAT_ADCS_POLL_OFFSET_MS, self._poll_sat_adcs)
 
     def _poll_base(self):
         if not (self.ser and self.ser.is_open):
@@ -266,11 +273,17 @@ class SatelliteGroundUI(tk.Tk):
         self._send_bytes(bytes([CMD_GET_BASE_SENSOR_DATA]))
         self.after(POLL_INTERVAL_MS, self._poll_base)
 
-    def _poll_sat(self):
+    def _poll_sat_xcvr(self):
         if not (self.ser and self.ser.is_open):
             return
-        self._send_bytes(bytes([CMD_GET_SAT_SENSOR_DATA]))
-        self.after(POLL_INTERVAL_MS, self._poll_sat)
+        self._send_bytes(bytes([CMD_GET_SAT_XCVR_DATA]))
+        self.after(POLL_INTERVAL_MS, self._poll_sat_xcvr)
+
+    def _poll_sat_adcs(self):
+        if not (self.ser and self.ser.is_open):
+            return
+        self._send_bytes(bytes([CMD_GET_SAT_ADCS_DATA]))
+        self.after(POLL_INTERVAL_MS, self._poll_sat_adcs)
 
     # ── ADCS commands ─────────────────────────────────────────────────────────
 
@@ -382,15 +395,19 @@ class SatelliteGroundUI(tk.Tk):
             self.base_pot_var.set(f"{pot:.1f} %")
             return
 
-        if cmd_id == CMD_RESP_SAT_SENSOR_DATA and len(pkt) >= 21:
-            self.log(f"SAT PKT [{len(pkt)}B]: {pkt.hex(' ').upper()}")
-            sat_temp  = unpack_float_le(pkt, 1)
-            pot       = unpack_float_le(pkt, 5)
-            yaw       = unpack_float_le(pkt, 9)
-            yaw_rate  = unpack_float_le(pkt, 13)
-            imu_temp  = unpack_float_le(pkt, 17)
+        if cmd_id == CMD_RESP_SAT_XCVR_DATA and len(pkt) >= 9:
+            self.log(f"SAT XCVR [{len(pkt)}B]: {pkt.hex(' ').upper()}")
+            sat_temp = unpack_float_le(pkt, 1)
+            pot      = unpack_float_le(pkt, 5)
             self.sat_temp_var.set(f"{sat_temp:.2f} °C")
             self.sat_pot_var.set(f"{pot:.1f} %")
+            return
+
+        if cmd_id == CMD_RESP_SAT_ADCS_DATA and len(pkt) >= 13:
+            self.log(f"SAT ADCS [{len(pkt)}B]: {pkt.hex(' ').upper()}")
+            yaw      = unpack_float_le(pkt, 1)
+            yaw_rate = unpack_float_le(pkt, 5)
+            imu_temp = unpack_float_le(pkt, 9)
             self.sat_yaw_var.set(f"{yaw:.4f} rad")
             self.sat_yaw_rate_var.set(f"{yaw_rate:.2f} °/s")
             self.sat_imu_temp_var.set(f"{imu_temp:.2f} °C")
